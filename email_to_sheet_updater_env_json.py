@@ -20,7 +20,7 @@ SHEET_NAME = "Sheet1"
 # Initialize OpenAI
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Google Sheets connection
+# Connect to Google Sheets
 def connect_google_sheets():
     credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
     creds = service_account.Credentials.from_service_account_info(
@@ -30,17 +30,16 @@ def connect_google_sheets():
     service = build('sheets', 'v4', credentials=creds)
     return service.spreadsheets()
 
-# Gmail IMAP connection
+# Connect to Gmail
 def connect_gmail():
     mail = imaplib.IMAP4_SSL('imap.gmail.com')
     mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
     mail.select('inbox')
     return mail
 
-# Read latest unread email with "Alumni Update" in subject
+# Read latest alumni update email
 def read_latest_email(mail):
-    # Search for ALL emails (not just UNSEEN)
-    typ, data = mail.search(None, 'ALL')
+    typ, data = mail.search(None, 'ALL')  # Read all emails
     print("Raw search output:", data)
 
     mail_ids = data[0].split()
@@ -48,8 +47,8 @@ def read_latest_email(mail):
         print("No emails found.")
         return None
 
-    # Loop through the latest emails (start from newest)
-    for num in reversed(mail_ids[-10:]):  # Only check the last 10 emails to be fast
+    # Check latest 10 emails
+    for num in reversed(mail_ids[-10:]):
         typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
@@ -57,7 +56,6 @@ def read_latest_email(mail):
         subject = msg["subject"]
         if subject:
             print(f"Checking email subject: {subject}")
-
             if "alumni update" in subject.lower():
                 print(f"✅ Found alumni update email: {subject}")
                 if msg.is_multipart():
@@ -69,26 +67,6 @@ def read_latest_email(mail):
 
     print("No matching alumni update email found.")
     return None
-
-
-    latest_email_id = mail_ids[-1]
-    typ, msg_data = mail.fetch(latest_email_id, '(BODY.PEEK[])')
-    raw_email = msg_data[0][1]
-    msg = email.message_from_bytes(raw_email)
-
-    subject = msg["subject"]
-    print(f"New email found: {subject}")
-
-    if subject and "alumni update" in subject.lower():
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == 'text/plain':
-                    return part.get_payload(decode=True).decode()
-        else:
-            return msg.get_payload(decode=True).decode()
-    else:
-        print(f"Ignored email (wrong subject): {subject}")
-        return None
 
 # Extract name and note using GPT
 def extract_update(text):
@@ -130,7 +108,7 @@ def update_sheet(data):
     match = get_close_matches(match_name, df["Full Name Lower"].tolist(), n=1, cutoff=0.8)
 
     if match:
-        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2
+        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header and 1-indexing
         note_text = data.get("note", "")
         if note_text:
             today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -141,10 +119,22 @@ def update_sheet(data):
                 values[0].append(note_column)
                 for row in values[1:]:
                     row.append("")
-                sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!A1", body={"values": values}).execute()
+                sheets.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{SHEET_NAME}!A1",
+                    body={"values": values},
+                    valueInputOption="RAW"
+                ).execute()
 
-            col_idx = df.columns.get_loc(note_column) + 1 if note_column in df.columns else len(values[0])
-            sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!{chr(64+col_idx)}{idx}", body={"values": [[note_text]]}, valueInputOption="RAW").execute()
+            # Update the specific alumni's note
+            col_idx = values[0].index(note_column)
+            update_range = f"{SHEET_NAME}!{chr(65+col_idx)}{idx}"
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=update_range,
+                body={"values": [[note_text]]},
+                valueInputOption="RAW"
+            ).execute()
             print(f"✅ Added note for {match_name}")
 
     else:
@@ -170,3 +160,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
