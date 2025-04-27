@@ -1,173 +1,141 @@
-import openai
-import pandas as pd
-import json
 import os
-import time
-from datetime import datetime
-from difflib import get_close_matches
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
 import imaplib
 import email
+from email.header import decode_header
+import json
+import openai
+import time
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Settings
-GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-SHEET_NAME = "Sheet1"
+# ====== SETUP ======
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Initialize OpenAI
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+IMAP_SERVER = os.getenv("IMAP_SERVER")
+EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# Connect to Google Sheets
-def connect_google_sheets():
-    credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
-    creds = service_account.Credentials.from_service_account_info(
-        credentials_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    service = build('sheets', 'v4', credentials=creds)
-    return service.spreadsheets()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
 
-# Connect to Gmail
-def connect_gmail():
-    mail = imaplib.IMAP4_SSL('imap.gmail.com')
-    mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
-    mail.select('inbox')
+processed_emails_memory = set()
+
+# ====== FUNCTIONS ======
+
+def login_to_gmail():
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+    mail.select("inbox")
     return mail
 
-# Global set to track processed emails
-processed_emails = set()
-
 def read_latest_email(mail):
-    typ, data = mail.search(None, 'ALL')
-    print("Raw search output:", data)
+    try:
+        status, messages = mail.search(None, 'ALL')
+        if status != "OK":
+            print("No messages found!")
+            return None
 
-    mail_ids = data[0].split()
-    if not mail_ids:
-        print("No emails found.")
-        return None
+        email_ids = messages[0].split()
+        latest_email_id = email_ids[-1]
 
-    # Loop through the latest 10 emails
-    for num in reversed(mail_ids[-10:]):
-        email_id = num.decode()
+        # Fetch the email by ID
+        res, msg = mail.fetch(latest_email_id, "(RFC822)")
+        if res != "OK":
+            print("Failed to fetch email")
+            return None
 
-        if email_id in processed_emails:
-            print(f"Already processed email ID {email_id}, skipping.")
-            continue
-
-        typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
-        raw_email = msg_data[0][1]
-        msg = email.message_from_bytes(raw_email)
-
-        subject = msg["subject"]
-        if subject:
-            print(f"Checking email subject: {subject}")
-            if "alumni update" in subject.lower():
-                print(f"✅ Found alumni update email: {subject}")
-                processed_emails.add(email_id)  # Record this email ID as processed
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == 'text/plain':
-                            return part.get_payload(decode=True).decode()
+        for response in msg:
+            if isinstance(response, tuple):
+                msg = email.message_from_bytes(response[1])
+                subject, encoding = decode_header(msg["Subject"])[0]
+                if isinstance(subject, bytes):
+                    subject = subject.decode(encoding if encoding else "utf-8")
+                from_ = msg.get("From")
+                if subject.strip() == "Alumni Update" and latest_email_id not in processed_emails_memory:
+                    print(f"\n✅ Found alumni update email: {subject}")
+                    processed_emails_memory.add(latest_email_id)
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            content_type = part.get_content_type()
+                            content_disposition = str(part.get("Content-Disposition"))
+                            if content_type == "text/plain" and "attachment" not in content_disposition:
+                                body = part.get_payload(decode=True).decode()
+                                return body
+                    else:
+                        body = msg.get_payload(decode=True).decode()
+                        return body
                 else:
-                    return msg.get_payload(decode=True).decode()
+                    print(f"Skipping already processed or irrelevant email: {subject}")
+                    return None
+    except imaplib.IMAP4.abort as e:
+        print(f"[Reconnect] IMAP connection lost during read: {e}")
+        raise e
 
-    print("No matching alumni update email found.")
-    return None
+def parse_email_with_gpt(email_body):
+    prompt = f"""
+Extract the full name and note from the following email. Return only JSON format like { '{"full name": "Name", "note": "note content"}' }. No extra text.
 
+Email:
+""" + email_body
 
-# Extract name and note using GPT
-def extract_update(text):
-    prompt = f"""Extract the alumni's full name and their note from the following text.
-
-Return ONLY JSON like:
-{{
-  "full name": "",
-  "note": ""
-}}
-
-If no note, leave it blank.
-
-Text: "{text}"
-"""
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
+    response = openai.chat.completions.create(
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
-    text = response.choices[0].message.content
-    return json.loads(text)
 
-# Update Google Sheet with note
-def update_sheet(data):
-    sheets = connect_google_sheets()
-    result = sheets.values().get(spreadsheetId=SPREADSHEET_ID, range=SHEET_NAME).execute()
-    values = result.get('values', [])
-    df = pd.DataFrame(values[1:], columns=values[0])
+    raw_text = response.choices[0].message.content.strip()
+    data = json.loads(raw_text)
+    return data
 
-    if "First Name" not in df.columns or "Last Name" not in df.columns:
-        print("❌ Error: Sheet must have 'First Name' and 'Last Name' columns for matching.")
-        return
+def append_to_sheet(data):
+    creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-    df["Full Name Lower"] = (df["First Name"].str.lower() + " " + df["Last Name"].str.lower())
+    full_name = data["full name"].strip()
+    note = data["note"].strip()
 
-    match_name = data.get("full name", "").lower()
+    records = sheet.get_all_records()
+    names = [r['Name'].strip().lower() for r in records]
 
-    match = get_close_matches(match_name, df["Full Name Lower"].tolist(), n=1, cutoff=0.8)
-
-    if match:
-        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header and 1-indexing
-        note_text = data.get("note", "")
-        if note_text:
-            today = datetime.utcnow().strftime("%Y-%m-%d")
-            note_column = f"Note - {today}"
-
-            if note_column not in df.columns:
-                print(f"Adding missing column {note_column}")
-                values[0].append(note_column)
-                for row in values[1:]:
-                    row.append("")
-                sheets.values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"{SHEET_NAME}!A1",
-                    body={"values": values},
-                    valueInputOption="RAW"
-                ).execute()
-
-            # Update the specific alumni's note
-            col_idx = values[0].index(note_column)
-            update_range = f"{SHEET_NAME}!{chr(65+col_idx)}{idx}"
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=update_range,
-                body={"values": [[note_text]]},
-                valueInputOption="RAW"
-            ).execute()
-            print(f"✅ Added note for {match_name}")
-
+    if full_name.lower() in names:
+        row_num = names.index(full_name.lower()) + 2
     else:
-        print(f"❌ No matching alumni found for {match_name}")
+        row_num = len(records) + 2
+        sheet.update(f'A{row_num}', full_name)
 
-# Main function loop
+    header = sheet.row_values(1)
+    if 'Notes' not in header:
+        sheet.update_cell(1, len(header)+1, 'Notes')
+
+    notes_col_num = sheet.row_values(1).index('Notes') + 1
+    sheet.update_cell(row_num, notes_col_num, note)
+
+# ====== MAIN LOOP ======
+
 def main():
-    mail = connect_gmail()
+    mail = login_to_gmail()
+
     while True:
-        print("Checking for new emails...")
-        text = read_latest_email(mail)
-        if text:
-            print("Parsing alumni update email...")
-            try:
-                data = extract_update(text)
-                print("GPT extracted:", data)
-                update_sheet(data)
-            except Exception as e:
-                print(f"❌ Error during GPT parsing or updating: {e}")
-        else:
-            print("No relevant new email found.")
-        time.sleep(120)
+        try:
+            print("Checking for new emails...")
+            email_body = read_latest_email(mail)
+
+            if email_body:
+                print("Parsing alumni update email...")
+                parsed_data = parse_email_with_gpt(email_body)
+                print(f"GPT extracted: {parsed_data}")
+
+                print("Appending data to sheet...")
+                append_to_sheet(parsed_data)
+                print(f"✅ Added note for {parsed_data['full name'].lower()}")
+
+        except imaplib.IMAP4.abort:
+            mail = login_to_gmail()
+            print("🔄 Reconnected to Gmail.")
+
+        time.sleep(15)  # Wait before checking again
 
 if __name__ == "__main__":
     main()
-
