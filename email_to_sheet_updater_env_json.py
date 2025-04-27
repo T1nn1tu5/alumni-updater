@@ -39,11 +39,37 @@ def connect_gmail():
 
 # Read latest unread email with "Alumni Update" in subject
 def read_latest_email(mail):
-    typ, data = mail.search(None, '(UNSEEN)')
+    # Search for ALL emails (not just UNSEEN)
+    typ, data = mail.search(None, 'ALL')
+    print("Raw search output:", data)
+
     mail_ids = data[0].split()
     if not mail_ids:
-        print("No unread emails found.")
+        print("No emails found.")
         return None
+
+    # Loop through the latest emails (start from newest)
+    for num in reversed(mail_ids[-10:]):  # Only check the last 10 emails to be fast
+        typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        subject = msg["subject"]
+        if subject:
+            print(f"Checking email subject: {subject}")
+
+            if "alumni update" in subject.lower():
+                print(f"✅ Found alumni update email: {subject}")
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == 'text/plain':
+                            return part.get_payload(decode=True).decode()
+                else:
+                    return msg.get_payload(decode=True).decode()
+
+    print("No matching alumni update email found.")
+    return None
+
 
     latest_email_id = mail_ids[-1]
     typ, msg_data = mail.fetch(latest_email_id, '(BODY.PEEK[])')
