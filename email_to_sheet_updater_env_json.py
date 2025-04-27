@@ -182,10 +182,11 @@ def main():
         if text:
             print("Parsing alumni update email...")
             data = extract_update(text)
+            print("GPT extracted:", data)  # <<<<<<<<<< ADD THIS
             update_sheet(data)
         else:
             print("No relevant new email found.")
-        time.sleep(120)  # Wait 2 minutes before next check
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
