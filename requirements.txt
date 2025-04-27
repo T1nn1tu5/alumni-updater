@@ -1,4 +1,5 @@
 openai>=1.0.0
+gspread
 pandas
 google-api-python-client
 google-auth
