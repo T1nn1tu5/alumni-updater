@@ -181,9 +181,12 @@ def main():
         text = read_latest_email(mail)
         if text:
             print("Parsing alumni update email...")
-            data = extract_update(text)
-            print("GPT extracted:", data)  # <<<<<<<<<< ADD THIS
-            update_sheet(data)
+            try:
+                data = extract_update(text)
+                print("GPT extracted:", data)
+                update_sheet(data)
+            except Exception as e:
+                print(f"❌ Error during GPT parsing or updating: {e}")
         else:
             print("No relevant new email found.")
         time.sleep(60)
