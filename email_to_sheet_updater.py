@@ -23,10 +23,13 @@ openai.api_key = OPENAI_API_KEY
 
 # Google Sheets connection
 def connect_google_sheets():
-    creds = service_account.Credentials.from_service_account_file(
-        "client_secret.json",
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    import json
+
+credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
+creds = service_account.Credentials.from_service_account_info(
+    credentials_info,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
     service = build('sheets', 'v4', credentials=creds)
     return service.spreadsheets()
 
