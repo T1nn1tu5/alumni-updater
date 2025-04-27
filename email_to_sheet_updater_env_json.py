@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 import time
+from datetime import datetime
 from difflib import get_close_matches
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -19,7 +20,7 @@ SHEET_NAME = "Sheet1"
 # Initialize OpenAI
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Google Sheets connection (using credentials from environment variable)
+# Google Sheets connection
 def connect_google_sheets():
     credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
     creds = service_account.Credentials.from_service_account_info(
@@ -36,7 +37,7 @@ def connect_gmail():
     mail.select('inbox')
     return mail
 
-# Read unread emails, only process if subject contains "Alumni Update"
+# Read latest unread email with "Alumni Update" in subject
 def read_latest_email(mail):
     typ, data = mail.search(None, '(UNSEEN)')
     mail_ids = data[0].split()
@@ -45,7 +46,7 @@ def read_latest_email(mail):
         return None
 
     latest_email_id = mail_ids[-1]
-    typ, msg_data = mail.fetch(latest_email_id, '(RFC822)')
+    typ, msg_data = mail.fetch(latest_email_id, '(BODY.PEEK[])')
     raw_email = msg_data[0][1]
     msg = email.message_from_bytes(raw_email)
 
@@ -63,35 +64,17 @@ def read_latest_email(mail):
         print(f"Ignored email (wrong subject): {subject}")
         return None
 
-# Extract structured alumni update using GPT
+# Extract name and note using GPT
 def extract_update(text):
-    prompt = f"""Extract the following fields from the alumni update text:
-- first name
-- last name
-- full name
-- current company
-- current job title
-- current location
-- linkedin profile
-- personal website
-- email address
-- note (if any additional info)
+    prompt = f"""Extract the alumni's full name and their note from the following text.
 
-Respond only with JSON like:
+Return ONLY JSON like:
 {{
-  "first name": "",
-  "last name": "",
   "full name": "",
-  "current company": "",
-  "current job title": "",
-  "current location": "",
-  "linkedin profile": "",
-  "personal website": "",
-  "email address": "",
   "note": ""
 }}
 
-If something is not mentioned, leave it blank.
+If no note, leave it blank.
 
 Text: "{text}"
 """
@@ -103,7 +86,7 @@ Text: "{text}"
     text = response.choices[0].message.content
     return json.loads(text)
 
-# Update Google Sheet
+# Update Google Sheet with note
 def update_sheet(data):
     sheets = connect_google_sheets()
     result = sheets.values().get(spreadsheetId=SPREADSHEET_ID, range=SHEET_NAME).execute()
@@ -116,64 +99,32 @@ def update_sheet(data):
 
     df["Full Name Lower"] = (df["First Name"].str.lower() + " " + df["Last Name"].str.lower())
 
-    # Determine name to match
-    full_name = data.get("full name", "")
-    first_name = data.get("first name", "")
-    last_name = data.get("last name", "")
-    if full_name:
-        match_name = full_name.lower()
-    else:
-        match_name = (first_name + " " + last_name).lower()
+    match_name = data.get("full name", "").lower()
 
     match = get_close_matches(match_name, df["Full Name Lower"].tolist(), n=1, cutoff=0.8)
 
     if match:
-        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header + 1-index
-        field_mapping = {
-            "first name": "First Name",
-            "last name": "Last Name",
-            "current company": "Current Company",
-            "current job title": "Current Job Title",
-            "current location": "Current Location",
-            "linkedin profile": "LinkedIn Profile",
-            "personal website": "Personal Website",
-            "email address": "Email"
-        }
+        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2
+        note_text = data.get("note", "")
+        if note_text:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            note_column = f"Note - {today}"
 
-        # Update fields
-        for key, column_name in field_mapping.items():
-            if data.get(key):
-                try:
-                    col_idx = df.columns.get_loc(column_name) + 1
-                except KeyError:
-                    print(f"Adding missing column {column_name}")
-                    values[0].append(column_name)
-                    for row in values[1:]:
-                        row.append("")
-                    col_idx = len(values[0])
-                    sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!A1", body={"values": values}).execute()
-
-                sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!{chr(64+col_idx)}{idx}", body={"values": [[data[key]]]}, valueInputOption="RAW").execute()
-                print(f"✅ Updated {key} for {match_name}")
-
-        # Handle notes separately
-        if data.get("note"):
-            note_col_name = "Notes"
-            if note_col_name not in df.columns:
-                print("Adding missing 'Notes' column")
-                values[0].append(note_col_name)
+            if note_column not in df.columns:
+                print(f"Adding missing column {note_column}")
+                values[0].append(note_column)
                 for row in values[1:]:
                     row.append("")
                 sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!A1", body={"values": values}).execute()
 
-            col_idx = df.columns.get_loc(note_col_name) + 1 if note_col_name in df.columns else len(values[0])
-            sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!{chr(64+col_idx)}{idx}", body={"values": [[data["note"]]]}, valueInputOption="RAW").execute()
+            col_idx = df.columns.get_loc(note_column) + 1 if note_column in df.columns else len(values[0])
+            sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!{chr(64+col_idx)}{idx}", body={"values": [[note_text]]}, valueInputOption="RAW").execute()
             print(f"✅ Added note for {match_name}")
 
     else:
         print(f"❌ No matching alumni found for {match_name}")
 
-# Main loop
+# Main function loop
 def main():
     mail = connect_gmail()
     while True:
@@ -189,7 +140,7 @@ def main():
                 print(f"❌ Error during GPT parsing or updating: {e}")
         else:
             print("No relevant new email found.")
-        time.sleep(60)
+        time.sleep(120)
 
 if __name__ == "__main__":
     main()
