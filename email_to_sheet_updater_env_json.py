@@ -37,9 +37,11 @@ def connect_gmail():
     mail.select('inbox')
     return mail
 
-# Read latest alumni update email
+# Global set to track processed emails
+processed_emails = set()
+
 def read_latest_email(mail):
-    typ, data = mail.search(None, 'ALL')  # Read all emails
+    typ, data = mail.search(None, 'ALL')
     print("Raw search output:", data)
 
     mail_ids = data[0].split()
@@ -47,8 +49,14 @@ def read_latest_email(mail):
         print("No emails found.")
         return None
 
-    # Check latest 10 emails
+    # Loop through the latest 10 emails
     for num in reversed(mail_ids[-10:]):
+        email_id = num.decode()
+
+        if email_id in processed_emails:
+            print(f"Already processed email ID {email_id}, skipping.")
+            continue
+
         typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
@@ -58,6 +66,7 @@ def read_latest_email(mail):
             print(f"Checking email subject: {subject}")
             if "alumni update" in subject.lower():
                 print(f"✅ Found alumni update email: {subject}")
+                processed_emails.add(email_id)  # Record this email ID as processed
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == 'text/plain':
@@ -67,6 +76,7 @@ def read_latest_email(mail):
 
     print("No matching alumni update email found.")
     return None
+
 
 # Extract name and note using GPT
 def extract_update(text):
