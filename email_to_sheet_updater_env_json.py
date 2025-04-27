@@ -19,7 +19,7 @@ SHEET_NAME = "Sheet1"
 # Initialize OpenAI
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Google Sheets connection (load from environment variable)
+# Google Sheets connection (using credentials from environment variable)
 def connect_google_sheets():
     credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
     creds = service_account.Credentials.from_service_account_info(
@@ -36,11 +36,12 @@ def connect_gmail():
     mail.select('inbox')
     return mail
 
-# Read latest unread email that matches "Alumni Update" in subject
+# Read unread emails, only process if subject contains "Alumni Update"
 def read_latest_email(mail):
     typ, data = mail.search(None, '(UNSEEN)')
     mail_ids = data[0].split()
     if not mail_ids:
+        print("No unread emails found.")
         return None
 
     latest_email_id = mail_ids[-1]
@@ -49,6 +50,8 @@ def read_latest_email(mail):
     msg = email.message_from_bytes(raw_email)
 
     subject = msg["subject"]
+    print(f"New email found: {subject}")
+
     if subject and "alumni update" in subject.lower():
         if msg.is_multipart():
             for part in msg.walk():
@@ -57,7 +60,7 @@ def read_latest_email(mail):
         else:
             return msg.get_payload(decode=True).decode()
     else:
-        print(f"Ignoring email with subject: {subject}")
+        print(f"Ignored email (wrong subject): {subject}")
         return None
 
 # Extract structured alumni update using GPT
@@ -177,13 +180,12 @@ def main():
         print("Checking for new emails...")
         text = read_latest_email(mail)
         if text:
-            print("New alumni update email received. Parsing...")
+            print("Parsing alumni update email...")
             data = extract_update(text)
             update_sheet(data)
         else:
-            print("No relevant new email.")
-        time.sleep(120)  # Check every 2 minutes
+            print("No relevant new email found.")
+        time.sleep(120)  # Wait 2 minutes before next check
 
 if __name__ == "__main__":
     main()
-
