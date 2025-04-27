@@ -1,75 +1,56 @@
 import os
-import imaplib
-import email
-from email.header import decode_header
 import json
-import openai
 import time
+import openai
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 # ====== SETUP ======
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-IMAP_SERVER = os.getenv("IMAP_SERVER")
-EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-
+GMAIL_QUERY = "subject:Alumni Update"
 processed_emails_memory = set()
 
 # ====== FUNCTIONS ======
 
-def login_to_gmail():
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-    mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-    mail.select("inbox")
-    return mail
+def gmail_service():
+    creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=[
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/spreadsheets"
+    ])
+    service = build('gmail', 'v1', credentials=creds)
+    return service
 
-def read_latest_email(mail):
-    try:
-        status, messages = mail.search(None, 'ALL')
-        if status != "OK":
-            print("No messages found!")
-            return None
+def sheets_service():
+    creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    client = gspread.authorize(creds)
+    return client
 
-        email_ids = messages[0].split()
-        latest_email_id = email_ids[-1]
+def get_latest_alumni_email(gmail):
+    results = gmail.users().messages().list(userId='me', q=GMAIL_QUERY, maxResults=1).execute()
+    messages = results.get('messages', [])
 
-        # Fetch the email by ID
-        res, msg = mail.fetch(latest_email_id, "(RFC822)")
-        if res != "OK":
-            print("Failed to fetch email")
-            return None
+    if not messages:
+        print("No new Alumni Update emails.")
+        return None
 
-        for response in msg:
-            if isinstance(response, tuple):
-                msg = email.message_from_bytes(response[1])
-                subject, encoding = decode_header(msg["Subject"])[0]
-                if isinstance(subject, bytes):
-                    subject = subject.decode(encoding if encoding else "utf-8")
-                from_ = msg.get("From")
-                if subject.strip() == "Alumni Update" and latest_email_id not in processed_emails_memory:
-                    print(f"\n✅ Found alumni update email: {subject}")
-                    processed_emails_memory.add(latest_email_id)
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            content_type = part.get_content_type()
-                            content_disposition = str(part.get("Content-Disposition"))
-                            if content_type == "text/plain" and "attachment" not in content_disposition:
-                                body = part.get_payload(decode=True).decode()
-                                return body
-                    else:
-                        body = msg.get_payload(decode=True).decode()
-                        return body
-                else:
-                    print(f"Skipping already processed or irrelevant email: {subject}")
-                    return None
-    except imaplib.IMAP4.abort as e:
-        print(f"[Reconnect] IMAP connection lost during read: {e}")
-        raise e
+    msg_id = messages[0]['id']
+    if msg_id in processed_emails_memory:
+        return None
+
+    msg = gmail.users().messages().get(userId='me', id=msg_id, format='full').execute()
+    for part in msg['payload'].get('parts', []):
+        if part['mimeType'] == 'text/plain':
+            email_body = part['body']['data']
+            import base64
+            decoded_body = base64.urlsafe_b64decode(email_body).decode('utf-8')
+            processed_emails_memory.add(msg_id)
+            return decoded_body
+
+    return None
 
 def parse_email_with_gpt(email_body):
     prompt = f"""
@@ -88,10 +69,8 @@ Email:
     data = json.loads(raw_text)
     return data
 
-def append_to_sheet(data):
-    creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+def append_to_sheet(data, sheet_client):
+    sheet = sheet_client.open_by_key(SPREADSHEET_ID).sheet1
 
     full_name = data["full name"].strip()
     note = data["note"].strip()
@@ -115,27 +94,24 @@ def append_to_sheet(data):
 # ====== MAIN LOOP ======
 
 def main():
-    mail = login_to_gmail()
+    gmail = gmail_service()
+    sheet_client = sheets_service()
 
     while True:
-        try:
-            print("Checking for new emails...")
-            email_body = read_latest_email(mail)
+        print("Checking for new emails...")
+        email_body = get_latest_alumni_email(gmail)
 
-            if email_body:
-                print("Parsing alumni update email...")
-                parsed_data = parse_email_with_gpt(email_body)
-                print(f"GPT extracted: {parsed_data}")
+        if email_body:
+            print("Parsing alumni update email...")
+            parsed_data = parse_email_with_gpt(email_body)
+            print(f"GPT extracted: {parsed_data}")
 
-                print("Appending data to sheet...")
-                append_to_sheet(parsed_data)
-                print(f"✅ Added note for {parsed_data['full name'].lower()}")
+            print("Appending data to sheet...")
+            append_to_sheet(parsed_data, sheet_client)
+            print(f"✅ Added note for {parsed_data['full name'].lower()}")
 
-        except imaplib.IMAP4.abort:
-            mail = login_to_gmail()
-            print("🔄 Reconnected to Gmail.")
-
-        time.sleep(15)  # Wait before checking again
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()
+
