@@ -1,13 +1,11 @@
 import openai
 import pandas as pd
-import base64
 import json
 import os
 import time
 from difflib import get_close_matches
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-import google.auth.transport.requests
 import imaplib
 import email
 
@@ -21,15 +19,13 @@ SHEET_NAME = "Sheet1"
 # Initialize OpenAI
 openai.api_key = OPENAI_API_KEY
 
-# Google Sheets connection
+# Google Sheets connection (load from ENV variable)
 def connect_google_sheets():
-    import json
-
-credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
-creds = service_account.Credentials.from_service_account_info(
-    credentials_info,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
+    credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
+    creds = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
     service = build('sheets', 'v4', credentials=creds)
     return service.spreadsheets()
 
@@ -70,7 +66,7 @@ Return JSON like:
   "job title": "...",
   "company": "..."
 }}
-""" 
+"""
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
@@ -92,7 +88,7 @@ def update_sheet(data):
 
     match = get_close_matches(name, df["Full Name Lower"].tolist(), n=1, cutoff=0.8)
     if match:
-        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header + 1-index
+        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header and 1-based index
         if job_title:
             title_col = df.columns.get_loc(next(c for c in df.columns if "job title" in c.lower())) + 1
             sheets.values().update(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_NAME}!{chr(64+title_col)}{idx}", body={"values": [[job_title]]}, valueInputOption="RAW").execute()
