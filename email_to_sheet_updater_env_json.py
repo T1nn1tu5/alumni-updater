@@ -67,15 +67,15 @@ Return JSON like:
   "company": "..."
 }}
 """
-client = openai.OpenAI()
+    client = openai.OpenAI()
 
-response = client.chat.completions.create(
-    model="gpt-3.5-turbo",
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0
-)
-text = response.choices[0].message.content
-return json.loads(text)
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    text = response.choices[0].message.content
+    return json.loads(text)
 
 # Update Google Sheet
 def update_sheet(data):
