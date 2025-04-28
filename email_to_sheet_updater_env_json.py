@@ -1,136 +1,162 @@
-import os
-import json
-import time
 import openai
-import gspread
-import base64
-import email
-from email.header import decode_header
-from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials
+import pandas as pd
+import json
+import os
+import time
+from datetime import datetime
+from difflib import get_close_matches
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2 import service_account
+import imaplib
+import email
 
-# ====== SETUP ======
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Settings
+GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
+SHEET_NAME = "Sheet1"
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-GMAIL_OAUTH_CLIENT_SECRET = json.loads(os.getenv("GMAIL_OAUTH_CLIENT_SECRET"))
-GMAIL_QUERY = 'subject:"Alumni Update"'
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-processed_emails_memory = set()
+# Initialize OpenAI
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== FUNCTIONS ======
+# Connect to Google Sheets
+def connect_google_sheets():
+    credentials_info = json.loads(os.environ.get("GOOGLE_CLIENT_SECRET_JSON"))
+    creds = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    service = build('sheets', 'v4', credentials=creds)
+    return service.spreadsheets()
 
-def login_to_gmail_oauth():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_config(GMAIL_OAUTH_CLIENT_SECRET, SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
-    service = build('gmail', 'v1', credentials=creds)
-    return service
+# Connect to Gmail
+def connect_gmail():
+    mail = imaplib.IMAP4_SSL('imap.gmail.com')
+    mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+    mail.select('inbox')
+    return mail
 
-def get_latest_alumni_email(gmail):
-    results = gmail.users().messages().list(userId='me', q=GMAIL_QUERY, maxResults=1).execute()
-    messages = results.get('messages', [])
-    if not messages:
-        print("No matching alumni emails found.")
+# Read latest alumni update email
+def read_latest_email(mail):
+    typ, data = mail.search(None, 'ALL')  # Read all emails
+    print("Raw search output:", data)
+
+    mail_ids = data[0].split()
+    if not mail_ids:
+        print("No emails found.")
         return None
 
-    msg = gmail.users().messages().get(userId='me', id=messages[0]['id']).execute()
-    email_data = msg['payload']
+    # Check latest 10 emails
+    for num in reversed(mail_ids[-10:]):
+        typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
 
-    headers = email_data.get("headers", [])
-    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "(No Subject)")
-    email_id = messages[0]['id']
+        subject = msg["subject"]
+        if subject:
+            print(f"Checking email subject: {subject}")
+            if "alumni update" in subject.lower():
+                print(f"✅ Found alumni update email: {subject}")
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == 'text/plain':
+                            return part.get_payload(decode=True).decode()
+                else:
+                    return msg.get_payload(decode=True).decode()
 
-    if subject.strip() == "Alumni Update" and email_id not in processed_emails_memory:
-        print(f"\n✅ Found alumni update email: {subject}")
-        processed_emails_memory.add(email_id)
-        body = ''
-        parts = email_data.get("parts", [])
-        for part in parts:
-            if part['mimeType'] == 'text/plain':
-                body = base64.urlsafe_b64decode(part['body']['data']).decode()
-                break
-        return body
-    else:
-        print(f"Skipping already processed or irrelevant email: {subject}")
-        return None
+    print("No matching alumni update email found.")
+    return None
 
-def parse_email_with_gpt(email_body):
-    prompt = f"""
-Extract the full name and note from the following email. Return only JSON format like { '{"full name": "Name", "note": "note content"}' }. No extra text.
+# Extract name and note using GPT
+def extract_update(text):
+    prompt = f"""Extract the alumni's full name and their note from the following text.
 
-Email:
-""" + email_body
+Return ONLY JSON like:
+{{
+  "full name": "",
+  "note": ""
+}}
 
-    response = openai.chat.completions.create(
-        model="gpt-4o",
+If no note, leave it blank.
+
+Text: "{text}"
+"""
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
+    text = response.choices[0].message.content
+    return json.loads(text)
 
-    raw_text = response.choices[0].message.content.strip()
-    data = json.loads(raw_text)
-    return data
+# Update Google Sheet with note
+def update_sheet(data):
+    sheets = connect_google_sheets()
+    result = sheets.values().get(spreadsheetId=SPREADSHEET_ID, range=SHEET_NAME).execute()
+    values = result.get('values', [])
+    df = pd.DataFrame(values[1:], columns=values[0])
 
-def append_to_sheet(data):
-    creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+    if "First Name" not in df.columns or "Last Name" not in df.columns:
+        print("❌ Error: Sheet must have 'First Name' and 'Last Name' columns for matching.")
+        return
 
-    full_name = data["full name"].strip()
-    note = data["note"].strip()
+    df["Full Name Lower"] = (df["First Name"].str.lower() + " " + df["Last Name"].str.lower())
 
-    records = sheet.get_all_records()
-    names = [r['Name'].strip().lower() for r in records]
+    match_name = data.get("full name", "").lower()
 
-    if full_name.lower() in names:
-        row_num = names.index(full_name.lower()) + 2
+    match = get_close_matches(match_name, df["Full Name Lower"].tolist(), n=1, cutoff=0.8)
+
+    if match:
+        idx = df[df["Full Name Lower"] == match[0]].index[0] + 2  # +2 for header and 1-indexing
+        note_text = data.get("note", "")
+        if note_text:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            note_column = f"Note - {today}"
+
+            if note_column not in df.columns:
+                print(f"Adding missing column {note_column}")
+                values[0].append(note_column)
+                for row in values[1:]:
+                    row.append("")
+                sheets.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{SHEET_NAME}!A1",
+                    body={"values": values},
+                    valueInputOption="RAW"
+                ).execute()
+
+            # Update the specific alumni's note
+            col_idx = values[0].index(note_column)
+            update_range = f"{SHEET_NAME}!{chr(65+col_idx)}{idx}"
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=update_range,
+                body={"values": [[note_text]]},
+                valueInputOption="RAW"
+            ).execute()
+            print(f"✅ Added note for {match_name}")
+
     else:
-        row_num = len(records) + 2
-        sheet.update(f'A{row_num}', full_name)
+        print(f"❌ No matching alumni found for {match_name}")
 
-    header = sheet.row_values(1)
-    if 'Notes' not in header:
-        sheet.update_cell(1, len(header)+1, 'Notes')
-
-    notes_col_num = sheet.row_values(1).index('Notes') + 1
-    sheet.update_cell(row_num, notes_col_num, note)
-
-# ====== MAIN LOOP ======
-
+# Main function loop
 def main():
-    gmail_service = login_to_gmail_oauth()
-
+    mail = connect_gmail()
     while True:
         print("Checking for new emails...")
-        try:
-            email_body = get_latest_alumni_email(gmail_service)
-
-            if email_body:
-                print("Parsing alumni update email...")
-                parsed_data = parse_email_with_gpt(email_body)
-                print(f"GPT extracted: {parsed_data}")
-
-                print("Appending data to sheet...")
-                append_to_sheet(parsed_data)
-                print(f"✅ Added note for {parsed_data['full name'].lower()}")
-
-        except Exception as e:
-            print(f"Error occurred: {e}")
-
-        time.sleep(15)  # Wait before checking again
+        text = read_latest_email(mail)
+        if text:
+            print("Parsing alumni update email...")
+            try:
+                data = extract_update(text)
+                print("GPT extracted:", data)
+                update_sheet(data)
+            except Exception as e:
+                print(f"❌ Error during GPT parsing or updating: {e}")
+        else:
+            print("No relevant new email found.")
+        time.sleep(120)
 
 if __name__ == "__main__":
     main()
