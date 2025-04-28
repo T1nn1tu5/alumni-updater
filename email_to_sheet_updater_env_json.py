@@ -37,36 +37,36 @@ def connect_gmail():
     mail.select('inbox')
     return mail
 
-# Read latest alumni update email
 def read_latest_email(mail):
-    typ, data = mail.search(None, 'ALL')  # Read all emails
-    print("Raw search output:", data)
+    # Only search for emails with subject "Alumni Update"
+    typ, data = mail.search(None, '(SUBJECT "Alumni Update")')
 
     mail_ids = data[0].split()
     if not mail_ids:
-        print("No emails found.")
+        print("No Alumni Update emails found.")
         return None
 
-    # Check latest 10 emails
-    for num in reversed(mail_ids[-10:]):
-        typ, msg_data = mail.fetch(num, '(BODY.PEEK[])')
+    latest_ids = list(reversed(mail_ids[-10:]))  # Only last 10
+    print(f"Checking {len(latest_ids)} latest Alumni Update emails...")
+
+    for num in latest_ids:
+        typ, msg_data = mail.fetch(num, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])')
         raw_email = msg_data[0][1]
         msg = email.message_from_bytes(raw_email)
 
         subject = msg["subject"]
-        if subject:
-            print(f"Checking email subject: {subject}")
-            if "alumni update" in subject.lower():
-                print(f"✅ Found alumni update email: {subject}")
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == 'text/plain':
-                            return part.get_payload(decode=True).decode()
-                else:
-                    return msg.get_payload(decode=True).decode()
+        print(f"→ Subject: {subject}")
 
-    print("No matching alumni update email found.")
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == 'text/plain':
+                    return part.get_payload(decode=True).decode()
+        else:
+            return msg.get_payload(decode=True).decode()
+
+    print("No matching Alumni Update email found.")
     return None
+
 
 # Extract name and note using GPT
 def extract_update(text):
